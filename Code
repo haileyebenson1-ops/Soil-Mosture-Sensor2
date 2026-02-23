@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Arduino Sensor Web GUI</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 16px; max-width: 1100px; }
+    h1 { margin: 0 0 8px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 12px; border: 1px solid #ccc; background: #fff; border-radius: 10px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .card { border: 1px solid #e6e6e6; border-radius: 14px; padding: 12px; margin-top: 12px; }
+    label { display: inline-flex; gap: 8px; align-items: center; }
+    .status { padding: 6px 10px; border-radius: 999px; border: 1px solid #ddd; }
+    .status.ok { border-color: #b6f0c4; background: #effdf2; }
+    .status.bad { border-color: #ffd0d0; background: #fff1f1; }
+    #log { height: 180px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+           font-size: 12px; background: #0b0b0b; color: #eaeaea; padding: 10px; border-radius: 12px; }
+    canvas { width: 100%; height: 320px; border: 1px solid #eee; border-radius: 14px; }
+    .small { color: #666; font-size: 12px; }
+    .pill { font-size: 12px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 999px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  </style>
+</head>
+
+<body>
+  <h1>Arduino Sensor Web GUI</h1>
+  <div class="row">
+    <button id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+    <span id="status" class="status bad">Disconnected</span>
+    <span class="pill">Expected stream: <b>Data1,Data2</b></span>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label><input type="checkbox" id="chkSave" /> Saving Data (CSV)</label>
+      <button id="btnDownload" disabled>Download CSV</button>
+      <span class="small">Tip: Use Chrome/Edge on desktop. Web Serial won’t work on most mobile browsers.</span>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="btnLedOn" disabled>LED ON</button>
+      <button id="btnLedOff" disabled>LED OFF</button>
+      <span class="small">Sends <code>L1</code> / <code>L0</code> over serial.</span>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin:0 0 8px;">Live Plot</h3>
+      <canvas id="plot" width="900" height="360"></canvas>
+      <div class="row" style="margin-top:8px;">
+        <span class="pill">Latest Data1: <b id="v1">—</b></span>
+        <span class="pill">Latest Data2: <b id="v2">—</b></span>
+        <span class="pill">Points: <b id="nPts">0</b></span>
+      </div>
+      <div class="small" style="margin-top:8px;">
+        Plot shows both channels. Autoscale updates as new data arrives.
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px;">Raw Data</h3>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    // ---- Web Serial state ----
+    let port = null;
+    let reader = null;
+    let writer = null;
+    let keepReading = false;
+
+    // ---- Data buffers ----
+    const MAX_POINTS = 300; // keep plot snappy
+    const series1 = [];
+    const series2 = [];
+    const timeMs = [];
+
+    // ---- CSV capture ----
+    let csvLines = []; // header + rows
+    const csvHeader = "timestamp_iso,data1,data2\n";
+
+    // ---- UI ----
+    const btnConnect = document.getElementById("btnConnect");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const chkSave = document.getElementById("chkSave");
+    const btnDownload = document.getElementById("btnDownload");
+    const btnLedOn = document.getElementById("btnLedOn");
+    const btnLedOff = document.getElementById("btnLedOff");
+
+    const v1El = document.getElementById("v1");
+    const v2El = document.getElementById("v2");
+    const nPtsEl = document.getElementById("nPts");
+
+    const canvas = document.getElementById("plot");
+    const ctx = canvas.getContext("2d");
+
+    function setStatus(connected) {
+      statusEl.textContent = connected ? "Connected" : "Disconnected";
+      statusEl.classList.toggle("ok", connected);
+      statusEl.classList.toggle("bad", !connected);
+
+      btnConnect.disabled = connected;
+      btnDisconnect.disabled = !connected;
+
+      btnLedOn.disabled = !connected;
+      btnLedOff.disabled = !connected;
+    }
+
+    function logLine(s) {
+      logEl.textContent += s + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function clampArraySizes() {
+      while (series1.length > MAX_POINTS) { series1.shift(); series2.shift(); timeMs.shift(); }
+    }
+
+    function addPoint(d1, d2) {
+      const now = Date.now();
+      series1.push(d1);
+      series2.push(d2);
+      timeMs.push(now);
+      clampArraySizes();
+
+      v1El.textContent = String(d1);
+      v2El.textContent = String(d2);
+      nPtsEl.textContent = String(series1.length);
+
+      if (chkSave.checked) {
+        // timestamp in ISO for easier CSV usage
+        const iso = new Date(now).toISOString();
+        csvLines.push(`${iso},${d1},${d2}\n`);
+        btnDownload.disabled = csvLines.length === 0;
+      }
+
+      drawPlot();
+    }
+
+    function niceMinMax(arr) {
+      let mn = Infinity, mx = -Infinity;
+      for (const v of arr) { if (Number.isFinite(v)) { mn = Math.min(mn, v); mx = Math.max(mx, v); } }
+      if (!Number.isFinite(mn) || !Number.isFinite(mx)) return [0, 1];
+      if (mn === mx) return [mn - 1, mx + 1];
+      // add a little padding
+      const pad = (mx - mn) * 0.08;
+      return [mn - pad, mx + pad];
+    }
+
+    function clearCanvas() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function drawAxes(x0, y0, w, h) {
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "#ddd";
+      ctx.strokeRect(x0, y0, w, h);
+    }
+
+    function plotLine(values, x0, y0, w, h, yMin, yMax, strokeStyle) {
+      if (values.length < 2) return;
+      ctx.beginPath();
+      for (let i = 0; i < values.length; i++) {
+        const x = x0 + (i / (values.length - 1)) * w;
+        const t = (values[i] - yMin) / (yMax - yMin);
+        const y = y0 + (1 - t) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawLegend(x, y) {
+      ctx.font = "12px system-ui";
+      ctx.fillStyle = "#111";
+      ctx.fillText("Data1", x + 18, y + 10);
+      ctx.fillText("Data2", x + 18, y + 30);
+
+      ctx.fillStyle = "#000";
+      ctx.fillRect(x, y + 2, 12, 12);
+      ctx.fillStyle = "#444";
+      ctx.fillRect(x, y + 22, 12, 12);
+    }
+
+    function drawPlot() {
+      clearCanvas();
+
+      const pad = 36;
+      const x0 = pad, y0 = 16;
+      const w = canvas.width - pad - 16;
+      const h = canvas.height - 16 - pad;
+
+      drawAxes(x0, y0, w, h);
+
+      // Autoscale using combined range
+      const [min1, max1] = niceMinMax(series1);
+      const [min2, max2] = niceMinMax(series2);
+      const yMin = Math.min(min1, min2);
+      const yMax = Math.max(max1, max2);
+
+      // simple ticks (no fancy labels)
+      ctx.fillStyle = "#666";
+      ctx.font = "11px system-ui";
+      ctx.fillText(yMax.toFixed(2), 6, y0 + 10);
+      ctx.fillText(yMin.toFixed(2), 6, y0 + h);
+
+      // Two lines (use default colors, but we must pick *some* strokeStyle)
+      plotLine(series1, x0, y0, w, h, yMin, yMax, "#000");
+      plotLine(series2, x0, y0, w, h, yMin, yMax, "#444");
+
+      drawLegend(x0 + 8, y0 + 8);
+    }
+
+    async function writeLineToSerial(line) {
+      if (!writer) return;
+      const data = new TextEncoder().encode(line + "\n");
+      await writer.write(data);
+    }
+
+    async function connect() {
+      if (!("serial" in navigator)) {
+        alert("Web Serial not supported. Use Chrome or Edge on desktop (HTTPS).");
+        return;
+      }
+
+      // Ask user to pick a port
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 9600 });
+
+      writer = port.writable.getWriter();
+      keepReading = true;
+
+      setStatus(true);
+      logLine("[Connected]");
+
+      // Start read loop
+      readLoop().catch(err => {
+        console.error(err);
+        logLine("[Read error] " + err.message);
+      });
+    }
+
+    async function disconnect() {
+      keepReading = false;
+
+      try {
+        if (reader) { await reader.cancel(); reader.releaseLock(); reader = null; }
+      } catch {}
+
+      try {
+        if (writer) { writer.releaseLock(); writer = null; }
+      } catch {}
+
+      try {
+        if (port) { await port.close(); port = null; }
+      } catch {}
+
+      setStatus(false);
+      logLine("[Disconnected]");
+    }
+
+    async function readLoop() {
+      const textDecoder = new TextDecoderStream();
+      const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+
+      const streamReader = textDecoder.readable.getReader();
+      reader = streamReader;
+
+      let buffer = "";
+
+      while (keepReading) {
+        const { value, done } = await streamReader.read();
+        if (done) break;
+        if (!value) continue;
+
+        buffer += value;
+        let lines = buffer.split("\n");
+        buffer = lines.pop(); // keep incomplete line
+
+        for (const lineRaw of lines) {
+          const line = lineRaw.trim();
+          if (!line) continue;
+
+          logLine(line);
+
+          // Expect "Data1,Data2"
+          const parts = line.split(",");
+          if (parts.length >= 2) {
+            const d1 = Number(parts[0]);
+            const d2 = Number(parts[1]);
+            if (Number.isFinite(d1) && Number.isFinite(d2)) {
+              addPoint(d1, d2);
+            }
+          }
+        }
+      }
+
+      await readableStreamClosed.catch(() => {});
+    }
+
+    function downloadCSV() {
+      const content = csvHeader + csvLines.join("");
+      const blob = new Blob([content], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "data.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      URL.revokeObjectURL(url);
+    }
+
+    // ---- Events ----
+    btnConnect.addEventListener("click", connect);
+    btnDisconnect.addEventListener("click", disconnect);
+
+    chkSave.addEventListener("change", () => {
+      if (chkSave.checked) {
+        // reset capture on each enable (simple + predictable)
+        csvLines = [];
+        btnDownload.disabled = true;
+        logLine("[Saving enabled] Capturing CSV rows…");
+      } else {
+        logLine("[Saving disabled]");
+      }
+    });
+
+    btnDownload.addEventListener("click", downloadCSV);
+
+    btnLedOn.addEventListener("click", async () => {
+      await writeLineToSerial("L1");
+      logLine("[TX] L1");
+    });
+
+    btnLedOff.addEventListener("click", async () => {
+      await writeLineToSerial("L0");
+      logLine("[TX] L0");
+    });
+
+    // Initial draw
+    drawPlot();
+    setStatus(false);
+  </script>
+</body>
+</html>
